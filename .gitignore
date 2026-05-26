@@ -1,0 +1,26 @@
+# MEX binaries (platform-specific, must be rebuilt per host)
+*.mexa64
+*.mexw64
+*.mexmaci64
+*.mexmaca64
+
+# MATLAB autosave / backup
+*.asv
+*.m~
+
+# Output files
+*.mat
+
+# Build artifacts
+*.o
+*.obj
+*.d
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Internal tooling (Claude Code project guidance)
+CLAUDE.md
