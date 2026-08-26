@@ -10,10 +10,10 @@ function build_mex(varargin)
 %   REQUIREMENTS
 %     * MATLAB R2024b or newer.  The +cudss wrappers assume native
 %       single-precision sparse support (introduced in R2024b).
-%     * CUDA Toolkit compatible with the installed cuDSS and MATLAB
-%       (CUDA 12 was used in testing).
-%     * NVIDIA cuDSS 0.7.1 installed locally (the only tested version);
-%       install path resolved as described below.
+%     * CUDA Toolkit compatible with the installed cuDSS (cuDSS 0.7.x
+%       expects CUDA 12.x).
+%     * NVIDIA cuDSS 0.7.x installed locally; install path resolved as
+%       described below.
 %
 %   Resolution order for the cuDSS install path:
 %     1. 'CudssPath' name/value argument
@@ -27,10 +27,10 @@ function build_mex(varargin)
 %     2. gpuDevice().ComputeCapability  (e.g. '8.9' -> 'sm_89')
 %     3. Fallback: 'sm_89' (RTX 4080 / RTX 4090 / Hopper-era Ada)
 %
-%   Output binary lands in +cudss/private/, where MATLAB's package
-%   dispatch finds it but it is not directly callable by users (the
-%   +cudss/{factor,solve,destroy,wait}.m wrappers call it via the
-%   string-command dispatcher in cudss_solver.cu).
+%   Output binary lands in subFunctions/gpu_solvers/cudss_solver/+cudss/private/,
+%   where MATLAB's package dispatch finds it but it is not directly
+%   callable by users (the +cudss/{factor,solve,destroy,wait}.m wrappers
+%   call it via the string-command dispatcher in cudss_solver.cu).
 
     % --- enforce MATLAB R2024b or newer (native single sparse) ---
     if isMATLABReleaseOlderThan('R2024b')
@@ -78,7 +78,7 @@ function build_mex(varargin)
     end
     if ~isfile(fullfile(inc_dir, 'cudss.h'))
         error('cudss:BuildPath', ...
-              'cudss.h not found at %s. Verify cuDSS version (tested with 0.7.1).', ...
+              'cudss.h not found at %s. Verify cuDSS version (expected 0.7.x).', ...
               inc_dir);
     end
 

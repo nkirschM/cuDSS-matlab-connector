@@ -83,10 +83,10 @@ struct SolverState {
     // When the factor handler is called with opts.async = true, a
     // std::thread runs cudssExecute(ANALYSIS) + cudssExecute(FACTORIZATION).
     // This hides cuDSS's host-side METIS reordering / symbolic factor
-    // (single-threaded inside the library, potentially ~seconds on
-    // large sparse matrices) behind unrelated GPU or CPU work the
-    // caller queues concurrently.  The numeric factor kernels are
-    // queued onto state->stream so they also overlap.
+    // (single-threaded inside the library, ~seconds at typical mesh
+    // sizes) behind unrelated GPU or CPU work the caller queues
+    // concurrently.  The numeric factor kernels are queued onto
+    // state->stream so they also overlap.
     //
     // Two layers of in-flight state need to outlive the MEX call:
     //   1. The worker thread itself.  Joined by handle_wait,

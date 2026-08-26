@@ -14,7 +14,9 @@ function handle = factor(K, opts)
 %             are NOT validated -- they are declared via opts.matrix_type
 %             (see below) and the caller is responsible for the declaration
 %             being true.  The default 'general' makes no assumption about K
-%             and factors via full LU.
+%             (factor via LU), which matches the typical caller that
+%             assembles K_full = blkdiag(K_x_el,K_y_el,K_z_el) - T_op - N_op
+%             (non-symmetric by construction).
 %     opts  : (optional) struct with fields
 %               .precision    'single' (default) | 'double'.  Must match the
 %                             storage class of K (single sparse K with
@@ -44,6 +46,17 @@ function handle = factor(K, opts)
 %                             flush any in-flight factor state.
 %               .verbose      false (default) | true.  Print per-phase
 %                             timing breakdowns from MATLAB and the MEX.
+%               .hybrid       false (default) | true. Operates such that
+%                             memory is split between system and VRAM to reduce VRAM
+%                             requirements. A memory limit MUST be specified in order for
+%                             this to work. Otherwise max VRAM is always used.
+%               .hybrid_memory_limit_gib    limit that cudSS can use for
+%                                           VRAM. Must be greater than minimum value estimated in
+%                                           memory report. in GiB, not GB
+%               .hybrid_memory_report       reports the estimated max and
+%                                           min system and GPU memory needed to run a solve both in and
+%                                           out of hybrid mode. Use the min hybrid VRAM value plus a
+%                                           buffer for memory limit
 %
 %   OUTPUT
 %     handle: uint64 scalar opaque token.  Must be passed to cudss.solve
@@ -117,6 +130,29 @@ function handle = factor(K, opts)
         error('cudss:BadOpts', 'opts.verbose must be a logical scalar.');
     end
 
+    hybrid = getfield_default(opts, 'hybrid', false);
+    if ~(islogical(hybrid) && isscalar(hybrid))
+        error('cudss:BadOpts', 'opts.hybrid must be a logical scalar.');
+    end
+
+    hybrid_memory_limit_gib = getfield_default(opts, ...
+                                               'hybrid_memory_limit_gib', 0);
+
+    if ~(isnumeric(hybrid_memory_limit_gib) && ...
+         isscalar(hybrid_memory_limit_gib) && ...
+         isfinite(hybrid_memory_limit_gib) && ...
+         hybrid_memory_limit_gib >= 0)
+
+        error('cudss:BadOpts', ...
+              'opts.hybrid_memory_limit_gib must be a nonnegative numeric scalar.');
+    end
+    hybrid_memory_report = getfield_default(opts, ...
+        'hybrid_memory_report', false);
+
+    if ~(islogical(hybrid_memory_report) && isscalar(hybrid_memory_report))
+        error('cudss:BadOpts', ...
+            'opts.hybrid_memory_report must be a logical scalar.');
+    end
     % --- cast to requested precision if needed (R2024b+: native single sparse) ---
     if verbose, t_cast = tic; end
     if strcmp(precision, 'single') && ~isa(K, 'single')
@@ -145,7 +181,10 @@ function handle = factor(K, opts)
     mex_opts = struct('precision',   precision, ...
                       'matrix_type', matrix_type, ...
                       'async',       logical(async_factor), ...
-                      'verbose',     logical(verbose));
+                      'verbose',     logical(verbose), ...
+                      'hybrid',      logical(hybrid), ...
+                      'hybrid_memory_limit_gib', hybrid_memory_limit_gib, ...
+                      'hybrid_memory_report', logical(hybrid_memory_report)); %limit is in GiB, 0 means no limit and the systems uses the heuristics method outlined in the cudSS documentation to determine memory usage and requests all the memory it believes it will need.
 
     if verbose, t_mex = tic; end
     handle = cudss_solver('factor', Kt, mex_opts);
