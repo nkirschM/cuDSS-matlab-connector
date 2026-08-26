@@ -83,6 +83,9 @@ results(end+1) = run_test_singular_K_detection(40, 'double');
 results(end+1) = run_test_stream_interleave(500, 4, 'single');
 results(end+1) = run_test_stream_interleave(500, 4, 'double');
 
+% --- reordering algorithm selection ---
+results(end+1) = run_test_reordering_alg(18);
+
 % --- hybrid host/device memory mode (single + double) ---
 results(end+1) = run_test_hybrid_memory(22, 4, 'single');
 results(end+1) = run_test_hybrid_memory(22, 4, 'double');
@@ -710,14 +713,65 @@ function r = run_test_stream_interleave(n, nrhs, prec)
     end
 end
 
+function r = run_test_reordering_alg(N)
+    % Every reordering algorithm must produce the same solution.
+    %
+    % CUDSS_CONFIG_REORDERING_ALG changes the fill-reducing permutation, so
+    % it changes the factor's sparsity, memory, and speed -- but never the
+    % solution.  Also checks that an unknown algorithm name is rejected.
+    n = N^3;
+    algs = {'default', 'alg1', 'alg2', 'alg3'};
+    name        = sprintf('reordering_alg agreement (%d^3 = %d)', N, n);
+    description = ['Factor the same K under reordering_alg default/alg1/alg2/alg3 and require ' ...
+                   'every one to solve to the same answer (the permutation changes fill, not ' ...
+                   'the solution).  An unrecognized algorithm name must raise cudss:BadOpts.'];
+    expected    = 'all algorithms residual < 1e-12; bad name raises cudss:BadOpts';
+    print_test_header(name, description, expected);
+    try
+        K = build_3d_laplacian(N);
+        rng(41);
+        L     = randn(n, 3);
+        L_gpu = gpuArray(L);
+
+        resids = nan(numel(algs), 1);
+        for k = 1:numel(algs)
+            h = cudss.factor(K, struct('precision', 'double', ...
+                                       'reordering_alg', algs{k}));
+            W = gather(cudss.solve(h, L_gpu));
+            cudss.destroy(h);
+            resids(k) = max(vecnorm(K * W - L) ./ max(vecnorm(L), eps));
+        end
+
+        bad_id = '';
+        try
+            h = cudss.factor(K, struct('precision', 'double', ...
+                                       'reordering_alg', 'alg99'));
+            cudss.destroy(h);
+        catch ME_bad
+            bad_id = ME_bad.identifier;
+        end
+
+        pass = all(resids < 1e-12) && strcmp(bad_id, 'cudss:BadOpts');
+        msg  = sprintf('residuals: %s (tol 1e-12); bad-name err id = "%s"', ...
+                       strjoin(arrayfun(@(k) sprintf('%s %.2e', algs{k}, resids(k)), ...
+                                        1:numel(algs), 'UniformOutput', false), ', '), ...
+                       bad_id);
+        print_test_result(pass, msg);
+        r = make_result(name, description, expected, pass, msg);
+    catch ME
+        print_test_result(false, ME.message);
+        r = make_result(name, description, expected, false, ME.message);
+    end
+end
+
 function r = run_test_hybrid_memory(N, nrhs, prec)
     % Hybrid host/device memory mode must not change the answer.
     %
     % Solves the same 3-D Laplacian three ways -- no hybrid, hybrid with no
     % device-memory limit, and hybrid with a limit derived from the minimum
     % cuDSS reports -- and requires all three to agree with the host solve.
-    % Hybrid mode relocates most of the factor to host memory, so it is a
-    % correctness risk (wrong data streamed back), not just a perf knob.
+    % Hybrid mode relocates most of the factor to host memory and streams it
+    % back per phase, so it can change the answer, not just the timing.
     n = N^3;
     [cast_fn, tol] = precision_params(prec, 'residual_laplacian');
     name        = sprintf('Hybrid memory mode (%d^3 = %d, nrhs=%d, %s)', N, n, nrhs, prec);
@@ -768,11 +822,10 @@ end
 
 function r = run_test_hybrid_memory_limit_rejection(N)
     % A hybrid device-memory limit below the cuDSS minimum must be rejected
-    % with cudss:HybridMemoryLimitTooSmall -- and, because that check fires
-    % inside the factor handler's try block (which owns a half-built
-    % SolverState), the wrapper must stay usable afterwards.  A regression
-    % here would show up as a leaked cuDSS handle / stream rather than a
-    % visible failure, so the follow-up factor is the real assertion.
+    % with cudss:HybridMemoryLimitTooSmall.  That check fires inside the
+    % factor handler's try block, which owns a half-built SolverState, so
+    % the follow-up factor/solve is the real assertion: it fails only if
+    % the aborted factor stranded a cuDSS handle or stream.
     n = N^3;
     name        = sprintf('Hybrid limit below minimum rejected (%d^3 = %d)', N, n);
     description = ['Request an impossibly small opts.hybrid_memory_limit_gib.  cudss.factor must ' ...

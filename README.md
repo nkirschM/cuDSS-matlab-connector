@@ -238,7 +238,7 @@ opts = struct( ...
     'matrix_type', 'general',  ...  % 'general' (default) | 'symmetric' | 'spd'
     'async',       false,      ...  % true: queue analysis + factor and return
     'verbose',     false,      ...  % per-phase ms timing printouts
-    'reordering',  'default',  ...  % only 'default' is honored today
+    'reordering_alg', 'default', ... % 'default' | 'alg1' | 'alg2' | 'alg3'
     'hybrid',      false,      ...  % true: hybrid host/device memory mode
     'hybrid_memory_limit_gib', 0, ... % device-memory cap in GiB; 0 = no cap
     'hybrid_memory_report',  false);  % print cuDSS memory estimates
@@ -267,8 +267,41 @@ handle = cudss.factor(K, opts);
 - `verbose=true` prints a ms breakdown for sparse cast / transpose /
   H2D / cuDSS analysis / cuDSS factorization.  Useful for finding
   where time goes when you first integrate the solver.
+- `reordering_alg` selects the fill-reducing ordering — see **Reordering
+  algorithm** below.  `reordering` is still accepted for backward
+  compatibility but only honors `'default'` (it warns otherwise).
 - `hybrid`, `hybrid_memory_limit_gib`, and `hybrid_memory_report` control
   hybrid host/device memory — see **Hybrid memory mode** below.
+
+---
+
+## Reordering algorithm
+
+`opts.reordering_alg` maps to `CUDSS_CONFIG_REORDERING_ALG`, the
+fill-reducing permutation cuDSS computes during analysis.  It changes the
+factor's sparsity — and therefore its memory and speed — but never the
+solution.
+
+**`'default'` (METIS-ND) is the right choice for essentially every caller.**
+Measured on a 325k-DOF sparse operator on an RTX 4080, it beats every
+alternative on *both* factor memory and per-RHS solve time:
+
+| `reordering_alg` | Factor time | Factor memory | Solve time / RHS |
+|------------------|-------------|---------------|------------------|
+| `'default'`      | 4.13 s      | 1640 MB       | 1.27e-3 s        |
+| `'alg1'`         | 41.4 s      | 11.3 GB       | 1.51e-2 s        |
+| `'alg2'`         | 41.3 s      | 11.3 GB       | 1.52e-2 s        |
+| `'alg3'`         | 2.51 s      | 1902 MB       | 3.43e-3 s        |
+
+`alg1` and `alg2` generate roughly 6.9× the fill and will exhaust a 16 GB
+card on a denser operator — treat them as a footgun.  `alg3` roughly halves
+analysis + factor time at about 2.7× the per-RHS cost, so it only wins when
+you solve fewer than roughly 750 right-hand sides against the factor —
+never for a factor-once / solve-many loop, which is what this wrapper is
+built for.
+
+These figures are hardware- and matrix-dependent.  Re-measure before
+trusting them on a different GPU or a different operator.
 
 ---
 

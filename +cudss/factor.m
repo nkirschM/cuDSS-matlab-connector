@@ -32,8 +32,31 @@ function handle = factor(K, opts)
 %                             not actually symmetric the solve silently uses
 %                             triu(K) and treats the lower triangle as if it
 %                             equaled triu(K)^T.
-%               .reordering   'default'.  Other reordering algorithms are
-%                             not exposed by the wrapper today.
+%               .reordering_alg
+%                             'default' (default) | 'alg1' | 'alg2' | 'alg3'.
+%                             Sets CUDSS_CONFIG_REORDERING_ALG, which picks
+%                             the fill-reducing ordering computed during
+%                             analysis.  'default' is cuDSS's METIS-ND and is
+%                             the right choice for essentially every caller.
+%                             Measured on a 325k-DOF sparse operator (RTX
+%                             4080), it beats every alternative on BOTH
+%                             factor memory and per-RHS solve time:
+%                               default   4.13 s   1640 MB   1.27e-3 s/RHS
+%                               alg1     41.4  s   11.3 GB   1.51e-2 s/RHS
+%                               alg2     41.3  s   11.3 GB   1.52e-2 s/RHS
+%                               alg3      2.51 s   1902 MB   3.43e-3 s/RHS
+%                             alg1/alg2 generate ~6.9x the fill and will
+%                             exhaust a 16 GB card on a denser operator --
+%                             treat them as a footgun.  alg3 roughly halves
+%                             analysis + factor time at ~2.7x the per-RHS
+%                             cost, so it only wins when you solve fewer
+%                             than roughly 750 right-hand sides against the
+%                             factor.  These numbers are hardware- and
+%                             matrix-dependent; re-measure before trusting
+%                             them elsewhere.
+%               .reordering   accepted for backward compatibility; only
+%                             'default' is honored (warns otherwise).  Use
+%                             .reordering_alg to select an algorithm.
 %               .async        false (default) | true.  When true, analysis
 %                             and factorization are queued onto the solver's
 %                             CUDA stream and the call returns without
@@ -153,6 +176,17 @@ function handle = factor(K, opts)
         error('cudss:BadOpts', 'opts.verbose must be a logical scalar.');
     end
 
+    reordering_alg = getfield_default(opts, 'reordering_alg', 'default');
+    if ~(ischar(reordering_alg) || (isstring(reordering_alg) && isscalar(reordering_alg)))
+        error('cudss:BadOpts', 'opts.reordering_alg must be a char/string.');
+    end
+    reordering_alg = char(reordering_alg);
+    if ~ismember(reordering_alg, {'default', 'alg1', 'alg2', 'alg3'})
+        error('cudss:BadOpts', ...
+              "opts.reordering_alg must be 'default', 'alg1', 'alg2', or 'alg3' (got '%s').", ...
+              reordering_alg);
+    end
+
     hybrid = getfield_default(opts, 'hybrid', false);
     if ~(islogical(hybrid) && isscalar(hybrid))
         error('cudss:BadOpts', 'opts.hybrid must be a logical scalar.');
@@ -203,6 +237,7 @@ function handle = factor(K, opts)
                       'matrix_type', matrix_type, ...
                       'async',       logical(async_factor), ...
                       'verbose',     logical(verbose), ...
+                      'reordering_alg', reordering_alg, ...
                       'hybrid',      logical(hybrid), ...
                       'hybrid_memory_limit_gib', double(hybrid_memory_limit_gib), ...
                       'hybrid_memory_report',    logical(hybrid_memory_report));

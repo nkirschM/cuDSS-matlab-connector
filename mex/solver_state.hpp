@@ -222,13 +222,13 @@ struct NumericalError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// Typed exception for an opts.hybrid_memory_limit_gib that is below the
-// device-memory minimum cuDSS reports after ANALYSIS.  Routed to
-// cudss:HybridMemoryLimitTooSmall so a caller can catch it specifically and
-// retry with a larger limit.  It is thrown rather than raised directly with
-// mexErrMsgIdAndTxt because it fires inside the factor handler's try block,
-// where a longjmp would skip the unique_ptr<SolverState> destructor and
-// strand the cuDSS handle, stream, and device CSR arrays.
+// Typed exception for an opts.hybrid_memory_limit_gib below the
+// device-memory minimum cuDSS reports after ANALYSIS.  Distinguished from a
+// generic std::runtime_error so the factor handler's catch block can route
+// it to cudss:HybridMemoryLimitTooSmall, which a caller can catch to retry
+// with a larger limit.  The condition is detected inside that handler's try
+// block, so it must unwind rather than longjmp -- see the exception-safety
+// note at the top of cudss_solver.cu.
 struct HybridMemoryLimitError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };

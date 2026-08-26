@@ -324,7 +324,6 @@ static void handle_factor(int nlhs, mxArray *plhs[],
             }
         }
     }
-    // Not const: cudssConfigSet takes a non-const void* for the value.
     int64_t hybrid_memory_limit_bytes = static_cast<int64_t>(
         hybrid_memory_limit_gib * 1024.0 * 1024.0 * 1024.0);
 
@@ -339,6 +338,31 @@ static void handle_factor(int nlhs, mxArray *plhs[],
                     "opts.hybrid_memory_report must be a logical scalar.");
             }
             hybrid_memory_report = mxIsLogicalScalarTrue(p);
+        }
+    }
+
+    // ---- parse opts.reordering_alg ('default'|'alg1'|'alg2'|'alg3') ----
+    // Maps to CUDSS_CONFIG_REORDERING_ALG, the fill-reducing ordering
+    // computed during ANALYSIS.  The default is METIS-ND; the ALG_1/2/3
+    // variants trade analysis cost against fill.
+    cudssAlgType_t reorder_alg = CUDSS_ALG_DEFAULT;
+    {
+        const mxArray *p = mxGetField(opts, 0, "reordering_alg");
+        if (p != nullptr && !mxIsEmpty(p)) {
+            if (!mxIsChar(p)) {
+                mexErrMsgIdAndTxt("cudss:BadOpts",
+                    "opts.reordering_alg must be 'default', 'alg1', 'alg2', or 'alg3'.");
+            }
+            char buf[16] = {0};
+            mxGetString(p, buf, sizeof(buf));
+            if      (std::strcmp(buf, "default") == 0) reorder_alg = CUDSS_ALG_DEFAULT;
+            else if (std::strcmp(buf, "alg1")    == 0) reorder_alg = CUDSS_ALG_1;
+            else if (std::strcmp(buf, "alg2")    == 0) reorder_alg = CUDSS_ALG_2;
+            else if (std::strcmp(buf, "alg3")    == 0) reorder_alg = CUDSS_ALG_3;
+            else {
+                mexErrMsgIdAndTxt("cudss:BadOpts",
+                    "opts.reordering_alg must be 'default', 'alg1', 'alg2', or 'alg3'.");
+            }
         }
     }
 
@@ -545,18 +569,15 @@ static void handle_factor(int nlhs, mxArray *plhs[],
                                      x_dummy, b_dummy));
             VERBOSE_TOC(t_analysis, "cudssExecute(ANALYSIS)");
             // ---- hybrid memory: report + apply the device-memory limit ----
-            //
-            // Both depend on state that only exists after ANALYSIS: cuDSS
-            // sizes the factor during the symbolic phase, so the memory
-            // estimates and the hard device-memory minimum are not
-            // meaningful until it has run.  The limit must still be set
-            // before FACTORIZATION, which is why this sits between the two.
+            // cuDSS sizes the factor during the symbolic phase, so the
+            // memory estimates and the device-memory minimum are only
+            // meaningful after ANALYSIS; the limit still has to be set
+            // before FACTORIZATION.
             if (hybrid_mode) {
                 // CUDSS_DATA_MEMORY_ESTIMATES writes a fixed-layout int64
-                // array; indices 0-3 are the non-hybrid permanent/peak
-                // device and host figures, 4-5 the hybrid minimum device
-                // and maximum host figures.  Zero-initialized so a short
-                // write from a future cuDSS just reads back as 0.
+                // array: 0-3 are the non-hybrid permanent/peak device and
+                // host figures, 4-5 the hybrid minimum device and maximum
+                // host figures, 6-15 reserved.
                 int64_t mem[16]  = {0};
                 size_t  written  = 0;
                 CUDSS_THROW(cudssDataGet(state->handle, state->data,
@@ -590,14 +611,11 @@ static void handle_factor(int nlhs, mxArray *plhs[],
                     mexEvalString("drawnow;");
                 }
 
-                // A limit of 0 leaves cuDSS on its own heuristic, which
-                // requests everything it estimates it needs -- so only a
-                // nonzero limit actually caps device memory.
                 if (hybrid_memory_limit_bytes > 0) {
                     if (hybrid_memory_limit_bytes < hybrid_min_device) {
-                        // Tear down the dummy descriptors / buffers first:
-                        // they are locals on the sync path, so the
-                        // unique_ptr destructor does not own them.
+                        // The dummy descriptors / buffers are locals on the
+                        // sync path, so the unique_ptr destructor does not
+                        // own them.
                         cudssMatrixDestroy(b_dummy);
                         cudssMatrixDestroy(x_dummy);
                         cudaFree(d_b_dummy);
