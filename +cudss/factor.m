@@ -44,6 +44,42 @@ function handle = factor(K, opts)
 %                             flush any in-flight factor state.
 %               .verbose      false (default) | true.  Print per-phase
 %                             timing breakdowns from MATLAB and the MEX.
+%               .hybrid       false (default) | true.  Enable cuDSS hybrid
+%                             host/device memory mode, which keeps the bulk
+%                             of the factor in host memory and streams the
+%                             pieces it needs to the GPU.  This trades some
+%                             throughput for a much smaller device-memory
+%                             footprint, letting K's that do not fit in VRAM
+%                             be factored.  On its own this does NOT reduce
+%                             device memory: cuDSS still takes as much as it
+%                             wants unless you also set
+%                             hybrid_memory_limit_gib (see below).
+%               .hybrid_memory_limit_gib
+%                             0 (default) | positive scalar.  Device-memory
+%                             ceiling for the hybrid factor, in GiB (2^30
+%                             bytes, not GB).  0 leaves cuDSS on its own
+%                             heuristic, which requests everything it
+%                             estimates it needs -- so a nonzero limit is
+%                             what actually caps VRAM use.  cuDSS computes a
+%                             hard minimum during analysis; a limit below
+%                             that raises cudss:HybridMemoryLimitTooSmall
+%                             and reports both numbers.  Use
+%                             hybrid_memory_report to find the minimum, then
+%                             add headroom.  Ignored when hybrid is false.
+%               .hybrid_memory_report
+%                             false (default) | true.  After analysis, print
+%                             cuDSS's device / host memory estimates, the
+%                             minimum device memory the hybrid factor needs,
+%                             and the peak host memory it will use.  Run
+%                             once to size hybrid_memory_limit_gib.  Ignored
+%                             when hybrid is false.
+%
+%               NOTE: hybrid_memory_limit_gib and hybrid_memory_report are
+%               applied on the synchronous factor path only.  With
+%               async=true the hybrid mode itself is still enabled, but the
+%               limit is not applied and no report is printed, because both
+%               depend on post-analysis state that is only available once
+%               the worker thread has run.
 %
 %   OUTPUT
 %     handle: uint64 scalar opaque token.  Must be passed to cudss.solve
@@ -117,6 +153,24 @@ function handle = factor(K, opts)
         error('cudss:BadOpts', 'opts.verbose must be a logical scalar.');
     end
 
+    hybrid = getfield_default(opts, 'hybrid', false);
+    if ~(islogical(hybrid) && isscalar(hybrid))
+        error('cudss:BadOpts', 'opts.hybrid must be a logical scalar.');
+    end
+
+    hybrid_memory_limit_gib = getfield_default(opts, 'hybrid_memory_limit_gib', 0);
+    if ~(isnumeric(hybrid_memory_limit_gib) && isscalar(hybrid_memory_limit_gib) && ...
+         isreal(hybrid_memory_limit_gib) && isfinite(hybrid_memory_limit_gib) && ...
+         hybrid_memory_limit_gib >= 0)
+        error('cudss:BadOpts', ...
+              'opts.hybrid_memory_limit_gib must be a nonnegative real scalar.');
+    end
+
+    hybrid_memory_report = getfield_default(opts, 'hybrid_memory_report', false);
+    if ~(islogical(hybrid_memory_report) && isscalar(hybrid_memory_report))
+        error('cudss:BadOpts', 'opts.hybrid_memory_report must be a logical scalar.');
+    end
+
     % --- cast to requested precision if needed (R2024b+: native single sparse) ---
     if verbose, t_cast = tic; end
     if strcmp(precision, 'single') && ~isa(K, 'single')
@@ -142,10 +196,16 @@ function handle = factor(K, opts)
     if verbose, fprintf('  [cudss.factor] sparse transpose: %.3fs\n', toc(t_trans)); end
 
     % --- pack opts into the struct shape the MEX expects ---
+    % hybrid_memory_limit_gib is passed through in GiB and converted to bytes
+    % inside the MEX.  0 means "no limit": cuDSS falls back to its own
+    % heuristic and requests all the device memory it estimates it needs.
     mex_opts = struct('precision',   precision, ...
                       'matrix_type', matrix_type, ...
                       'async',       logical(async_factor), ...
-                      'verbose',     logical(verbose));
+                      'verbose',     logical(verbose), ...
+                      'hybrid',      logical(hybrid), ...
+                      'hybrid_memory_limit_gib', double(hybrid_memory_limit_gib), ...
+                      'hybrid_memory_report',    logical(hybrid_memory_report));
 
     if verbose, t_mex = tic; end
     handle = cudss_solver('factor', Kt, mex_opts);

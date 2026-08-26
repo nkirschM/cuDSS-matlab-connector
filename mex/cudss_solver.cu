@@ -56,6 +56,20 @@
 // flushes implicitly) before reading any result that depends on the
 // factor.
 //
+// HYBRID MEMORY
+// -------------
+// opts.hybrid enables CUDSS_CONFIG_HYBRID_MODE, which keeps the bulk of
+// the factor in host memory and streams the pieces cuDSS needs onto the
+// device.  It is set before ANALYSIS because it changes the symbolic
+// factor that gets built.  opts.hybrid_memory_limit_gib caps device
+// memory, but can only be applied *between* ANALYSIS and FACTORIZATION:
+// cuDSS reports the hard minimum (CUDSS_DATA_HYBRID_DEVICE_MEMORY_MIN)
+// only once the symbolic phase has sized the factor.  A limit of 0 leaves
+// cuDSS on its own heuristic, which requests everything it estimates it
+// needs -- so only a nonzero limit actually bounds VRAM.  Both the limit
+// and opts.hybrid_memory_report are sync-path only; the async worker
+// cannot call mexPrintf or raise, so it takes hybrid mode without them.
+//
 // STREAM HANDLING
 // ---------------
 // Each SolverState owns a private CUDA stream.  MATLAB's gpuArrays live
@@ -88,7 +102,9 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -272,6 +288,59 @@ static void handle_factor(int nlhs, mxArray *plhs[],
             verbose = mxIsLogicalScalarTrue(p);
         }
     }
+    // ---- parse opts.hybrid (cuDSS hybrid host/device memory mode) ----
+    bool hybrid_mode = false;
+    {
+        const mxArray *p = mxGetField(opts, 0, "hybrid");
+        if (p != nullptr && !mxIsEmpty(p)) {
+            if (!mxIsLogicalScalar(p) ||
+                mxGetNumberOfElements(p) != 1) {
+                mexErrMsgIdAndTxt("cudss:BadOpts",
+                    "opts.hybrid must be a logical scalar.");
+            }
+            hybrid_mode = mxIsLogicalScalarTrue(p);
+        }
+    }
+
+    // ---- parse opts.hybrid_memory_limit_gib ----
+    // 0.0 means: leave cuDSS on its automatic hybrid-memory heuristic, which
+    // requests as much device memory as it estimates it needs.  A nonzero
+    // value is what actually caps device-memory use.  Checked against
+    // CUDSS_DATA_HYBRID_DEVICE_MEMORY_MIN after ANALYSIS, below.
+    double hybrid_memory_limit_gib = 0.0;
+    {
+        const mxArray *p = mxGetField(opts, 0, "hybrid_memory_limit_gib");
+        if (p != nullptr && !mxIsEmpty(p)) {
+            if (!mxIsNumeric(p) || mxIsComplex(p) ||
+                mxGetNumberOfElements(p) != 1) {
+                mexErrMsgIdAndTxt("cudss:BadOpts",
+                    "opts.hybrid_memory_limit_gib must be a nonnegative real scalar.");
+            }
+            hybrid_memory_limit_gib = mxGetScalar(p);
+            if (!std::isfinite(hybrid_memory_limit_gib) ||
+                hybrid_memory_limit_gib < 0.0) {
+                mexErrMsgIdAndTxt("cudss:BadOpts",
+                    "opts.hybrid_memory_limit_gib must be finite and >= 0.");
+            }
+        }
+    }
+    // Not const: cudssConfigSet takes a non-const void* for the value.
+    int64_t hybrid_memory_limit_bytes = static_cast<int64_t>(
+        hybrid_memory_limit_gib * 1024.0 * 1024.0 * 1024.0);
+
+    // ---- parse opts.hybrid_memory_report ----
+    bool hybrid_memory_report = false;
+    {
+        const mxArray *p = mxGetField(opts, 0, "hybrid_memory_report");
+        if (p != nullptr && !mxIsEmpty(p)) {
+            if (!mxIsLogicalScalar(p) ||
+                mxGetNumberOfElements(p) != 1) {
+                mexErrMsgIdAndTxt("cudss:BadOpts",
+                    "opts.hybrid_memory_report must be a logical scalar.");
+            }
+            hybrid_memory_report = mxIsLogicalScalarTrue(p);
+        }
+    }
 
     // ---- parse opts.matrix_type ('general' | 'symmetric' | 'spd') ----
     // The MATLAB wrapper extracts triu(K) for symmetric/spd before
@@ -330,9 +399,10 @@ static void handle_factor(int nlhs, mxArray *plhs[],
     // that into a normal MATLAB error.
     try {
         std::unique_ptr<SolverState> state(new SolverState());
-        state->is_single  = is_single;
-        state->value_type = is_single ? CUDA_R_32F : CUDA_R_64F;
-        state->n          = static_cast<int>(mxGetN(Kt));
+        state->is_single   = is_single;
+        state->value_type  = is_single ? CUDA_R_32F : CUDA_R_64F;
+        state->n           = static_cast<int>(mxGetN(Kt));
+        state->hybrid_mode = hybrid_mode;
 
         // MATLAB sparse uses mwIndex (size_t-ish) for Jc / Ir.  cuDSS
         // expects 32-bit int for CSR row offsets and column indices.
@@ -406,6 +476,18 @@ static void handle_factor(int nlhs, mxArray *plhs[],
         CUDSS_THROW(cudssConfigCreate(&state->config));
         CUDSS_THROW(cudssDataCreate(state->handle, &state->data));
 
+        // Hybrid mode must be enabled before ANALYSIS: it changes the
+        // symbolic factor cuDSS builds (which supernodes live on the host
+        // vs the device).  The device-memory *limit* is applied later,
+        // after ANALYSIS, because the permitted minimum is only known then.
+        if (hybrid_mode) {
+            int enable_hybrid = 1;
+            CUDSS_THROW(cudssConfigSet(state->config,
+                                       CUDSS_CONFIG_HYBRID_MODE,
+                                       &enable_hybrid,
+                                       sizeof(enable_hybrid)));
+        }
+
         // Pre-create the cross-stream sync event used by handle_solve.
         // cudaEventDisableTiming makes record/wait pure ordering ops
         // (no timing payload), which is all we need.
@@ -413,8 +495,9 @@ static void handle_factor(int nlhs, mxArray *plhs[],
                                             cudaEventDisableTiming));
         VERBOSE_TOC(t_cudss_create, "cudssCreate + stream + config + event");
 
-        // Config is left at cuDSS defaults: METIS-ND reordering, no
-        // iterative refinement, no hybrid memory.
+        // Config is otherwise left at cuDSS defaults: METIS-ND reordering
+        // and no iterative refinement.  Hybrid memory is off unless
+        // opts.hybrid enabled it above.
 
         VERBOSE_TIC(t_csr_desc);
         CUDSS_THROW(cudssMatrixCreateCsr(
@@ -461,6 +544,81 @@ static void handle_factor(int nlhs, mxArray *plhs[],
                                      state->config, state->data, state->A,
                                      x_dummy, b_dummy));
             VERBOSE_TOC(t_analysis, "cudssExecute(ANALYSIS)");
+            // ---- hybrid memory: report + apply the device-memory limit ----
+            //
+            // Both depend on state that only exists after ANALYSIS: cuDSS
+            // sizes the factor during the symbolic phase, so the memory
+            // estimates and the hard device-memory minimum are not
+            // meaningful until it has run.  The limit must still be set
+            // before FACTORIZATION, which is why this sits between the two.
+            if (hybrid_mode) {
+                // CUDSS_DATA_MEMORY_ESTIMATES writes a fixed-layout int64
+                // array; indices 0-3 are the non-hybrid permanent/peak
+                // device and host figures, 4-5 the hybrid minimum device
+                // and maximum host figures.  Zero-initialized so a short
+                // write from a future cuDSS just reads back as 0.
+                int64_t mem[16]  = {0};
+                size_t  written  = 0;
+                CUDSS_THROW(cudssDataGet(state->handle, state->data,
+                                         CUDSS_DATA_MEMORY_ESTIMATES,
+                                         mem, sizeof(mem), &written));
+
+                int64_t hybrid_min_device = 0;
+                size_t  min_written       = 0;
+                CUDSS_THROW(cudssDataGet(state->handle, state->data,
+                                         CUDSS_DATA_HYBRID_DEVICE_MEMORY_MIN,
+                                         &hybrid_min_device,
+                                         sizeof(hybrid_min_device),
+                                         &min_written));
+
+                const double GiB = 1024.0 * 1024.0 * 1024.0;
+
+                if (hybrid_memory_report) {
+                    mexPrintf("\n========== cuDSS HYBRID MEMORY ==========\n");
+                    mexPrintf("Permanent GPU memory:       %.3f GiB\n", mem[0] / GiB);
+                    mexPrintf("Peak GPU memory:            %.3f GiB\n", mem[1] / GiB);
+                    mexPrintf("Permanent system memory:    %.3f GiB\n", mem[2] / GiB);
+                    mexPrintf("Peak system memory:         %.3f GiB\n", mem[3] / GiB);
+                    mexPrintf("Minimum hybrid GPU memory:  %.3f GiB\n",
+                              hybrid_min_device / GiB);
+                    mexPrintf("Maximum hybrid host memory: %.3f GiB\n", mem[5] / GiB);
+                    if (hybrid_memory_limit_bytes > 0) {
+                        mexPrintf("Requested hybrid GPU limit: %.3f GiB\n",
+                                  hybrid_memory_limit_bytes / GiB);
+                    }
+                    mexPrintf("==========================================\n\n");
+                    mexEvalString("drawnow;");
+                }
+
+                // A limit of 0 leaves cuDSS on its own heuristic, which
+                // requests everything it estimates it needs -- so only a
+                // nonzero limit actually caps device memory.
+                if (hybrid_memory_limit_bytes > 0) {
+                    if (hybrid_memory_limit_bytes < hybrid_min_device) {
+                        // Tear down the dummy descriptors / buffers first:
+                        // they are locals on the sync path, so the
+                        // unique_ptr destructor does not own them.
+                        cudssMatrixDestroy(b_dummy);
+                        cudssMatrixDestroy(x_dummy);
+                        cudaFree(d_b_dummy);
+                        cudaFree(d_x_dummy);
+                        char msg[256];
+                        std::snprintf(msg, sizeof(msg),
+                            "opts.hybrid_memory_limit_gib = %.3f GiB is below the "
+                            "%.3f GiB minimum cuDSS reports for this matrix. "
+                            "Raise the limit (use opts.hybrid_memory_report to "
+                            "size it) or set it to 0 for no limit.",
+                            hybrid_memory_limit_bytes / GiB,
+                            hybrid_min_device / GiB);
+                        throw HybridMemoryLimitError(msg);
+                    }
+                    CUDSS_THROW(cudssConfigSet(
+                        state->config,
+                        CUDSS_CONFIG_HYBRID_DEVICE_MEMORY_LIMIT,
+                        &hybrid_memory_limit_bytes,
+                        sizeof(hybrid_memory_limit_bytes)));
+                }
+            }
 
             VERBOSE_TIC(t_factorize);
             CUDSS_THROW(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
@@ -580,6 +738,11 @@ static void handle_factor(int nlhs, mxArray *plhs[],
         // identifier regardless of whether they took the sync or async
         // factor path.
         mexErrMsgIdAndTxt("cudss:NumericalError", "%s", e.what());
+    } catch (const HybridMemoryLimitError &e) {
+        // opts.hybrid_memory_limit_gib below the post-analysis minimum.
+        // Distinct ID so a caller can catch it and retry with more headroom
+        // rather than treating it as an unexpected failure.
+        mexErrMsgIdAndTxt("cudss:HybridMemoryLimitTooSmall", "%s", e.what());
     } catch (const std::exception &e) {
         // Convert C++ exception (from any CUDA_THROW / CUDSS_THROW above)
         // into a normal MATLAB error.  unique_ptr's destructor has

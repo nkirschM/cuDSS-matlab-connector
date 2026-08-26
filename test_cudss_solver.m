@@ -83,6 +83,11 @@ results(end+1) = run_test_singular_K_detection(40, 'double');
 results(end+1) = run_test_stream_interleave(500, 4, 'single');
 results(end+1) = run_test_stream_interleave(500, 4, 'double');
 
+% --- hybrid host/device memory mode (single + double) ---
+results(end+1) = run_test_hybrid_memory(22, 4, 'single');
+results(end+1) = run_test_hybrid_memory(22, 4, 'double');
+results(end+1) = run_test_hybrid_memory_limit_rejection(22);
+
 % --- summary ---
 fprintf('\n================ TEST SUMMARY ================\n');
 n_pass = 0;
@@ -697,6 +702,110 @@ function r = run_test_stream_interleave(n, nrhs, prec)
                  max(norm(W_host, 'fro'), eps);
         pass = relerr < tol;
         msg  = sprintf('relerr after default-stream interleave = %.2e (tol %.0e)', relerr, tol);
+        print_test_result(pass, msg);
+        r = make_result(name, description, expected, pass, msg);
+    catch ME
+        print_test_result(false, ME.message);
+        r = make_result(name, description, expected, false, ME.message);
+    end
+end
+
+function r = run_test_hybrid_memory(N, nrhs, prec)
+    % Hybrid host/device memory mode must not change the answer.
+    %
+    % Solves the same 3-D Laplacian three ways -- no hybrid, hybrid with no
+    % device-memory limit, and hybrid with a limit derived from the minimum
+    % cuDSS reports -- and requires all three to agree with the host solve.
+    % Hybrid mode relocates most of the factor to host memory, so it is a
+    % correctness risk (wrong data streamed back), not just a perf knob.
+    n = N^3;
+    [cast_fn, tol] = precision_params(prec, 'residual_laplacian');
+    name        = sprintf('Hybrid memory mode (%d^3 = %d, nrhs=%d, %s)', N, n, nrhs, prec);
+    description = ['Factor the same K with hybrid off, hybrid on (no limit), and hybrid on with ' ...
+                   'a device-memory limit above the cuDSS-reported minimum.  All three must ' ...
+                   'produce the same solution, and the limited run must not error.'];
+    expected    = sprintf('all three configs: max ||K*w - l|| / ||l|| < %.0e (%s)', tol, prec);
+    print_test_header(name, description, expected);
+    try
+        K  = cast_fn(build_3d_laplacian(N));
+        rng(31);
+        L  = cast_fn(randn(n, nrhs));
+        L_gpu = gpuArray(L);
+
+        configs = { 'hybrid off', struct('precision', prec); ...
+                    'hybrid, no limit', struct('precision', prec, 'hybrid', true); ...
+                    'hybrid, 2 GiB limit', struct('precision', prec, 'hybrid', true, ...
+                                                  'hybrid_memory_limit_gib', 2) };
+
+        resids = zeros(size(configs, 1), 1);
+        W_ref  = [];
+        agree  = 0;
+        for k = 1:size(configs, 1)
+            h = cudss.factor(K, configs{k, 2});
+            W = gather(cudss.solve(h, L_gpu));
+            cudss.destroy(h);
+            resids(k) = max(vecnorm(double(K) * double(W) - double(L)) ./ ...
+                            max(vecnorm(double(L)), eps));
+            if k == 1
+                W_ref = double(W);
+            else
+                agree = max(agree, norm(double(W) - W_ref, 'fro') / ...
+                                   max(norm(W_ref, 'fro'), eps));
+            end
+        end
+
+        pass = all(resids < tol);
+        msg  = sprintf(['residuals: off %.2e, hybrid %.2e, hybrid+limit %.2e ' ...
+                        '(tol %.0e); max deviation from non-hybrid = %.2e'], ...
+                       resids(1), resids(2), resids(3), tol, agree);
+        print_test_result(pass, msg);
+        r = make_result(name, description, expected, pass, msg);
+    catch ME
+        print_test_result(false, ME.message);
+        r = make_result(name, description, expected, false, ME.message);
+    end
+end
+
+function r = run_test_hybrid_memory_limit_rejection(N)
+    % A hybrid device-memory limit below the cuDSS minimum must be rejected
+    % with cudss:HybridMemoryLimitTooSmall -- and, because that check fires
+    % inside the factor handler's try block (which owns a half-built
+    % SolverState), the wrapper must stay usable afterwards.  A regression
+    % here would show up as a leaked cuDSS handle / stream rather than a
+    % visible failure, so the follow-up factor is the real assertion.
+    n = N^3;
+    name        = sprintf('Hybrid limit below minimum rejected (%d^3 = %d)', N, n);
+    description = ['Request an impossibly small opts.hybrid_memory_limit_gib.  cudss.factor must ' ...
+                   'raise cudss:HybridMemoryLimitTooSmall, and a normal factor + solve + destroy ' ...
+                   'cycle must still succeed afterwards (proving the aborted factor was cleaned up).'];
+    expected    = 'cudss:HybridMemoryLimitTooSmall, then a clean factor/solve/destroy';
+    print_test_header(name, description, expected);
+    try
+        K = single(build_3d_laplacian(N));
+        rng(32);
+        L_gpu = gpuArray(single(randn(n, 2)));
+
+        err_id = '';
+        try
+            h = cudss.factor(K, struct('precision', 'single', 'hybrid', true, ...
+                                       'hybrid_memory_limit_gib', 1e-6));
+            cudss.destroy(h);
+        catch ME_lim
+            err_id = ME_lim.identifier;
+        end
+        rejected = strcmp(err_id, 'cudss:HybridMemoryLimitTooSmall');
+
+        % The wrapper must still be healthy after that aborted factor.
+        h = cudss.factor(K, struct('precision', 'single'));
+        W = gather(cudss.solve(h, L_gpu));
+        cudss.destroy(h);
+        resid = max(vecnorm(double(K) * double(W) - double(gather(L_gpu))) ./ ...
+                    max(vecnorm(double(gather(L_gpu))), eps));
+        recovered = resid < 1e-4;
+
+        pass = rejected && recovered;
+        msg  = sprintf('err id = "%s" (rejected = %s); post-error residual = %.2e (recovered = %s)', ...
+                       err_id, mat2str(rejected), resid, mat2str(recovered));
         print_test_result(pass, msg);
         r = make_result(name, description, expected, pass, msg);
     catch ME

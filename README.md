@@ -238,7 +238,10 @@ opts = struct( ...
     'matrix_type', 'general',  ...  % 'general' (default) | 'symmetric' | 'spd'
     'async',       false,      ...  % true: queue analysis + factor and return
     'verbose',     false,      ...  % per-phase ms timing printouts
-    'reordering',  'default');      % only 'default' is honored today
+    'reordering',  'default',  ...  % only 'default' is honored today
+    'hybrid',      false,      ...  % true: hybrid host/device memory mode
+    'hybrid_memory_limit_gib', 0, ... % device-memory cap in GiB; 0 = no cap
+    'hybrid_memory_report',  false);  % print cuDSS memory estimates
 
 handle = cudss.factor(K, opts);
 ```
@@ -264,6 +267,60 @@ handle = cudss.factor(K, opts);
 - `verbose=true` prints a ms breakdown for sparse cast / transpose /
   H2D / cuDSS analysis / cuDSS factorization.  Useful for finding
   where time goes when you first integrate the solver.
+- `hybrid`, `hybrid_memory_limit_gib`, and `hybrid_memory_report` control
+  hybrid host/device memory — see **Hybrid memory mode** below.
+
+---
+
+## Hybrid memory mode
+
+`opts.hybrid = true` enables cuDSS's hybrid host/device memory mode, which
+keeps the bulk of the factor in host memory and streams the pieces it needs
+onto the GPU.  That trades some throughput for a much smaller device-memory
+footprint, which is what lets a `K` whose factor does not fit in VRAM be
+factored at all.  The overhead has not been benchmarked here.
+
+**Enabling hybrid mode alone does not reduce VRAM use.**  Left at the
+default `hybrid_memory_limit_gib = 0`, cuDSS stays on its own heuristic and
+still requests everything it estimates it needs.  The limit is what actually
+caps device memory, so hybrid mode is a two-step setup:
+
+```matlab
+% 1. Measure. Run once with the report on to see what this K needs.
+opts = struct('hybrid', true, 'hybrid_memory_report', true);
+handle = cudss.factor(K, opts);
+cudss.destroy(handle);
+```
+
+```text
+========== cuDSS HYBRID MEMORY ==========
+Permanent GPU memory:       3.812 GiB
+Peak GPU memory:            4.219 GiB
+Permanent system memory:    0.004 GiB
+Peak system memory:         0.031 GiB
+Minimum hybrid GPU memory:  0.734 GiB
+Maximum hybrid host memory: 4.102 GiB
+==========================================
+```
+
+```matlab
+% 2. Cap. Take "Minimum hybrid GPU memory", add headroom, set the limit.
+opts = struct('hybrid', true, 'hybrid_memory_limit_gib', 1.5);
+handle = cudss.factor(K, opts);
+```
+
+The limit is in **GiB** (2³⁰ bytes), not GB.  cuDSS computes a hard minimum
+during analysis; a limit below it raises
+`cudss:HybridMemoryLimitTooSmall` and reports both the requested and the
+required figure, so you can retry with more headroom rather than guessing.
+
+Both `hybrid_memory_limit_gib` and `hybrid_memory_report` depend on state
+that only exists after cuDSS's analysis phase has sized the factor, and they
+are applied between analysis and factorization.  **That happens on the
+synchronous factor path only** — with `async = true` hybrid mode is still
+enabled, but the limit is not applied and no report is printed, because the
+worker thread cannot print to MATLAB or raise an error from a non-MATLAB
+thread.  Size the limit with a synchronous factor first if you need both.
 
 ---
 
@@ -388,6 +445,7 @@ where the body can error, `onCleanup` is what keeps GPU memory honest.
 | `cudss:InvalidHandle`             | `uint64` passed to `solve`/`wait` is not in the live registry. |
 | `cudss:AlreadyDestroyed`          | (warning) destroy called on a stale handle; no-op. |
 | `cudss:NumericalError`            | cuDSS returned success but reported a non-zero `CUDSS_DATA_INFO` (typically zero/negative pivot) — matrix is likely singular, or `matrix_type='spd'` was used on a non-PD K. Same ID from sync and async factor paths. |
+| `cudss:HybridMemoryLimitTooSmall` | `opts.hybrid_memory_limit_gib` is below the device-memory minimum cuDSS reports for this matrix after analysis. Message carries both figures; raise the limit or set it to 0. |
 | `cudss:CudssError`                | A cuDSS API call failed; full status name + numeric code are in the message. |
 | `cudss:CudaError`                 | A CUDA Runtime call failed; `cudaError` name + numeric code are in the message. |
 | `cudss:Error`                     | Catch-all for unexpected exceptions raised during factor construction (CUDA or cuDSS failures inside the exception-safe path that aren't already classified above). |
